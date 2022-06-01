@@ -7,14 +7,128 @@ import numpy as np
 from librosa.util import normalize
 from scipy.io.wavfile import read
 from librosa.filters import mel as librosa_mel_fn
+import glob
+from pathlib import Path
+from collections import Counter
+from torchaudio import transforms
+from audiomentations import (
+    Compose,
+    AddGaussianSNR,
+    ApplyImpulseResponse,
+    SevenBandParametricEQ,
+)
+
 
 MAX_WAV_VALUE = 32768.0
+SEQ_LENGTH = int(1.0 * 44100)
+MAX_SEQ_LENGTH = int(6.0 * 44100)
+NOISE_PATH = "/home/akorolev/master/projects/data/SpeechData/noise_data/datasets_fullband/noise_fullband"
+RIR_PATH = "/home/akorolev/master/projects/data/SpeechData/noise_data/datasets_fullband/impulse_responses/SLR26/simulated_rirs_48k/smallroom22050"
+# glob.glob(
+#     "/home/akorolev/master/projects/data/SpeechData/noise_data/datasets_fullband/impulse_responses/SLR26/simulated_rirs_48k/smallroom22050/**/*.wav",
+#     recursive=True,
+# )
+
+
+MAX_WAV_VALUE = 32768.0
+
+
+
+def load_w3_risen12(root_dir):
+    items = []
+    lang_dirs = os.listdir(root_dir)
+    for d in lang_dirs:
+        print(d)
+        tmp_items = []
+        speakers = []
+        metadata = os.path.join(root_dir, d, "metadata.csv")
+        with open(metadata, "r") as rf:
+            for line in rf:
+                cols = line.split("|")
+                text = cols[1]
+                if len(cols) < 3:
+                    continue
+                speaker = cols[2].replace("\n", "")
+                wav_file = os.path.join(root_dir, d, "wavs", cols[0])
+
+                if os.path.isfile(wav_file) and "ghost" not in wav_file.lower():
+                    if MAX_SEQ_LENGTH > Path(wav_file).stat().st_size // 2 > SEQ_LENGTH:
+                        sp_count = Counter(speakers)
+                        if sp_count[speaker] < 500:
+                            speakers.append(speaker)
+                            tmp_items.append([wav_file, speaker])
+
+        random.shuffle(tmp_items)
+        speaker_count = Counter(speakers)
+        for item in tmp_items:
+            if speaker_count[item[1]] > 30:
+                items.append(item[0])
+
+    return items
+
+
+def load_skyrim(root_dir):
+    items = []
+    speaker_dirs = os.listdir(root_dir)
+    for d in speaker_dirs:
+        wav_paths = glob.glob(os.path.join(root_dir, d, "*.wav"), recursive=True)
+        wav_paths = [Path(x) for x in wav_paths if "ghost" not in x.lower()]
+        np.random.shuffle(wav_paths)
+        filtered_wav = [
+            str(x)
+            for x in wav_paths
+            if MAX_SEQ_LENGTH > x.stat().st_size // 2 > SEQ_LENGTH
+        ]
+        if len(filtered_wav) > 100:
+            items.extend(filtered_wav[:400])
+    print("Skyrim:", len(items))
+    return items
+
+
+def find_wav_files(data_path, is_gothic=False):
+    wav_paths = glob.glob(os.path.join(data_path, "**", "*.wav"), recursive=True)
+    if is_gothic:
+        HERO_PATHS = [Path(x) for x in wav_paths if "pc_hero" in x.lower()]
+        OTHER_PATHS = [Path(x) for x in wav_paths if "pc_hero" not in x.lower()]
+        print(len(HERO_PATHS[:500]))
+        np.random.shuffle(HERO_PATHS)
+        wav_paths = OTHER_PATHS + HERO_PATHS[:500]
+    else:
+        wav_paths = [Path(x) for x in wav_paths if "ghost" not in x.lower()]
+    filtered_wav = [
+        str(x) for x in wav_paths if MAX_SEQ_LENGTH > x.stat().st_size // 2 > SEQ_LENGTH
+    ]
+    return filtered_wav
+
+
+def custom_data_load(eval_split_size):
+    gothic_wavs = find_wav_files(
+        "/home/akorolev/master/projects/data/SpeechData/tts/DialogSpeech/vocoder_train/44k_SR_Data/Gothic3",
+        True,
+    )
+    risen1_wavs = load_w3_risen12(
+        "/home/akorolev/master/projects/data/SpeechData/tts/DialogSpeech/vocoder_train/44k_SR_Data/Risen1/"
+    )
+    risen2_wavs = load_w3_risen12(
+        "/home/akorolev/master/projects/data/SpeechData/tts/DialogSpeech/vocoder_train/44k_SR_Data/Risen2/"
+    )
+    risen3_wavs = find_wav_files(
+        "/home/akorolev/master/projects/data/SpeechData/tts/DialogSpeech/vocoder_train/44k_SR_Data/Risen3"
+    )
+
+    skyrim_wavs = load_skyrim(
+        "/home/akorolev/master/projects/data/SpeechData/tts/DialogSpeech/vocoder_train/44k_SR_Data/Skyrim"
+    )
+
+    wav_paths = gothic_wavs + risen1_wavs + risen2_wavs + risen3_wavs + skyrim_wavs
+    print("Train Samples: ", len(wav_paths))
+    np.random.shuffle(wav_paths)
+    return wav_paths[:eval_split_size], wav_paths[eval_split_size:]
 
 
 def load_wav(full_path):
     sampling_rate, data = read(full_path)
     return data, sampling_rate
-
 
 def dynamic_range_compression(x, C=1, clip_val=1e-5):
     return np.log(np.clip(x, a_min=clip_val, a_max=None) * C)
@@ -44,6 +158,18 @@ def spectral_de_normalize_torch(magnitudes):
 
 mel_basis = {}
 hann_window = {}
+
+
+def _rms_norm(wav, db_level=-21):
+    r = 10 ** (db_level / 20)
+    a = np.sqrt((len(wav) * (r**2)) / np.sum(wav**2))
+    return wav * a
+
+
+def _rms_norm_torch(wav, db_level=-21):
+    r = 10 ** (db_level / 20)
+    a = torch.sqrt((len(wav) * (r**2)) / torch.sum(wav**2))
+    return wav * a
 
 
 def mel_spectrogram(y, n_fft, num_mels, sampling_rate, hop_size, win_size, fmin, fmax, center=False):
@@ -107,6 +233,29 @@ class MelDataset(torch.utils.data.Dataset):
         self.device = device
         self.fine_tuning = fine_tuning
         self.base_mels_path = base_mels_path
+        self.upsample = transforms.Resample(
+            orig_freq=22050,
+            new_freq=44100,
+            resampling_method="kaiser_window",
+            lowpass_filter_width=6,
+            rolloff=0.99,
+            dtype=torch.float32,
+        )
+        self.downsample = transforms.Resample(
+            orig_freq=44100,
+            new_freq=22050,
+            resampling_method="kaiser_window",
+            lowpass_filter_width=6,
+            rolloff=0.99,
+            dtype=torch.float32,
+        )
+        self.augmentor = Compose([
+                SevenBandParametricEQ( min_gain_db=-2.0, max_gain_db=2.0, p=0.5),
+                AddGaussianSNR(min_snr_in_db=45, max_snr_in_db=65, p=0.4),
+                ApplyImpulseResponse(
+                    RIR_PATH, leave_length_unchanged=True, lru_cache_size=500, p=0.3
+                ),])
+
 
     def __getitem__(self, index):
         filename = self.audio_files[index]
@@ -136,7 +285,19 @@ class MelDataset(torch.utils.data.Dataset):
                 else:
                     audio = torch.nn.functional.pad(audio, (0, self.segment_size - audio.size(1)), 'constant')
 
-            mel = mel_spectrogram(audio, self.n_fft, self.num_mels,
+            if True:
+                augmented_audio = self.augment(audio)
+            use_augmented = hasattr(augmented_audio, "shape") and (
+                augmented_audio.shape == audio.shape
+            )
+            if not use_augmented:
+                print(
+                    "Shape mismatch, audio not augmented",
+                    audio.shape,
+                    augmented_audio.shape,
+                )
+
+            mel = mel_spectrogram(augmented_audio if use_augmented else audio, self.n_fft, self.num_mels,
                                   self.sampling_rate, self.hop_size, self.win_size, self.fmin, self.fmax,
                                   center=False)
         else:
@@ -166,3 +327,20 @@ class MelDataset(torch.utils.data.Dataset):
 
     def __len__(self):
         return len(self.audio_files)
+
+
+    def augment(self, audio):
+        target_len = audio.size(1)
+        augmented_audio = self.downsample(audio)
+        augmented_audio = augmented_audio.squeeze(0).cpu().float().numpy()
+        augmented_audio = self.augmentor(
+            samples=augmented_audio,
+            sample_rate=22050,
+        )
+        augmented_audio = normalize(augmented_audio) * 0.95
+        augmented_audio = torch.FloatTensor(augmented_audio).unsqueeze(0)
+        augmented_audio = self.upsample(augmented_audio)
+        diff = augmented_audio.size(1) - target_len
+        if diff > 0 and diff <= 3:
+            augmented_audio = augmented_audio[:, :-diff]
+        return augmented_audio

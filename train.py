@@ -13,10 +13,11 @@ import torch.multiprocessing as mp
 from torch.distributed import init_process_group
 from torch.nn.parallel import DistributedDataParallel
 from env import AttrDict, build_env
-from meldataset import MelDataset, mel_spectrogram, get_dataset_filelist
+from meldataset import MelDataset, mel_spectrogram, get_dataset_filelist, custom_data_load
 from models import Generator, MultiPeriodDiscriminator, MultiScaleDiscriminator, feature_loss, generator_loss,\
     discriminator_loss
 from utils import plot_spectrogram, scan_checkpoint, load_checkpoint, save_checkpoint
+from torch.cuda.amp import autocast, GradScaler
 
 torch.backends.cudnn.benchmark = True
 
@@ -71,7 +72,9 @@ def train(rank, a, h):
     scheduler_g = torch.optim.lr_scheduler.ExponentialLR(optim_g, gamma=h.lr_decay, last_epoch=last_epoch)
     scheduler_d = torch.optim.lr_scheduler.ExponentialLR(optim_d, gamma=h.lr_decay, last_epoch=last_epoch)
 
-    training_filelist, validation_filelist = get_dataset_filelist(a)
+    scaler = GradScaler(enabled=h.fp16_run)
+
+    validation_filelist, training_filelist = custom_data_load(20)
 
     trainset = MelDataset(training_filelist, h.segment_size, h.n_fft, h.num_mels,
                           h.hop_size, h.win_size, h.sampling_rate, h.fmin, h.fmax, n_cache_reuse=0,
@@ -119,50 +122,59 @@ def train(rank, a, h):
             y_mel = torch.autograd.Variable(y_mel.to(device, non_blocking=True))
             y = y.unsqueeze(1)
 
-            y_g_hat = generator(x)
-            y_g_hat_mel = mel_spectrogram(y_g_hat.squeeze(1), h.n_fft, h.num_mels, h.sampling_rate, h.hop_size, h.win_size,
-                                          h.fmin, h.fmax_for_loss)
-
             optim_d.zero_grad()
+            with autocast(enabled=h.fp16_run):
+                y_g_hat = generator(x)
+                
+                # MPD
+                y_df_hat_r, y_df_hat_g, _, _ = mpd(y, y_g_hat.detach())
+                # MSD
+                y_ds_hat_r, y_ds_hat_g, _, _ = msd(y, y_g_hat.detach())
 
-            # MPD
-            y_df_hat_r, y_df_hat_g, _, _ = mpd(y, y_g_hat.detach())
-            loss_disc_f, losses_disc_f_r, losses_disc_f_g = discriminator_loss(y_df_hat_r, y_df_hat_g)
+                with autocast(enabled=False):
+                    loss_disc_f, losses_disc_f_r, losses_disc_f_g = discriminator_loss(y_df_hat_r, y_df_hat_g)
+                    loss_disc_s, losses_disc_s_r, losses_disc_s_g = discriminator_loss(y_ds_hat_r, y_ds_hat_g)
 
-            # MSD
-            y_ds_hat_r, y_ds_hat_g, _, _ = msd(y, y_g_hat.detach())
-            loss_disc_s, losses_disc_s_r, losses_disc_s_g = discriminator_loss(y_ds_hat_r, y_ds_hat_g)
+                    loss_disc_all = loss_disc_s + loss_disc_f
 
-            loss_disc_all = loss_disc_s + loss_disc_f
-
-            loss_disc_all.backward()
-            optim_d.step()
+            
+            scaler.scale(loss_disc_all).backward()
+            scaler.unscale_(optim_d)
+            scaler.step(optim_d)
 
             # Generator
             optim_g.zero_grad()
+            
+            
+            with autocast(enabled=h.fp16_run):
+                y_df_hat_r, y_df_hat_g, fmap_f_r, fmap_f_g = mpd(y, y_g_hat)
+                y_ds_hat_r, y_ds_hat_g, fmap_s_r, fmap_s_g = msd(y, y_g_hat)
+                with autocast(enabled=False):
+                    y_g_hat = y_g_hat.float()
+                    y_g_hat_mel = mel_spectrogram(y_g_hat.squeeze(1), h.n_fft, h.num_mels, h.sampling_rate, h.hop_size, h.win_size,
+                                h.fmin, h.fmax_for_loss)
+                    loss_fm_f = feature_loss(fmap_f_r, fmap_f_g)
+                    loss_fm_s = feature_loss(fmap_s_r, fmap_s_g)
+                    # L1 Mel-Spectrogram Loss
+                    loss_mel = F.l1_loss(y_mel, y_g_hat_mel) * 45
+                    loss_gen_f, losses_gen_f = generator_loss(y_df_hat_g)
+                    loss_gen_s, losses_gen_s = generator_loss(y_ds_hat_g)
+                    loss_gen_all = loss_gen_s + loss_gen_f + loss_fm_s + loss_fm_f + loss_mel
 
-            # L1 Mel-Spectrogram Loss
-            loss_mel = F.l1_loss(y_mel, y_g_hat_mel) * 45
-
-            y_df_hat_r, y_df_hat_g, fmap_f_r, fmap_f_g = mpd(y, y_g_hat)
-            y_ds_hat_r, y_ds_hat_g, fmap_s_r, fmap_s_g = msd(y, y_g_hat)
-            loss_fm_f = feature_loss(fmap_f_r, fmap_f_g)
-            loss_fm_s = feature_loss(fmap_s_r, fmap_s_g)
-            loss_gen_f, losses_gen_f = generator_loss(y_df_hat_g)
-            loss_gen_s, losses_gen_s = generator_loss(y_ds_hat_g)
-            loss_gen_all = loss_gen_s + loss_gen_f + loss_fm_s + loss_fm_f + loss_mel
-
-            loss_gen_all.backward()
-            optim_g.step()
+            scaler.scale(loss_gen_all).backward()
+            scaler.unscale_(optim_g)
+            scaler.step(optim_g)
+            scaler.update()
 
             if rank == 0:
                 # STDOUT logging
                 if steps % a.stdout_interval == 0:
                     with torch.no_grad():
                         mel_error = F.l1_loss(y_mel, y_g_hat_mel).item()
-
-                    print('Steps : {:d}, Gen Loss Total : {:4.3f}, Mel-Spec. Error : {:4.3f}, s/b : {:4.3f}'.
-                          format(steps, loss_gen_all, mel_error, time.time() - start_b))
+                    lr = optim_g.param_groups[0]["lr"]
+                    lr_d = optim_d.param_groups[0]["lr"]
+                    print('Steps : {:d}, Gen Loss Total : {:4.3f}, Mel-Spec. Error : {:4.3f}, s/b : {:4.3f}, LR_G: {:4.8f}, LR_D: {:4.8f}'.
+                          format(steps, loss_gen_all, mel_error, time.time() - start_b, lr, lr_d,))
 
                 # checkpointing
                 if steps % a.checkpoint_interval == 0 and steps != 0:
@@ -207,6 +219,12 @@ def train(rank, a, h):
                                 y_hat_spec = mel_spectrogram(y_g_hat.squeeze(1), h.n_fft, h.num_mels,
                                                              h.sampling_rate, h.hop_size, h.win_size,
                                                              h.fmin, h.fmax)
+
+                                sw.add_figure(
+                                    "a_noise/mel_spec_{}".format(j),
+                                    plot_spectrogram(x.squeeze(0).cpu().numpy()),
+                                    steps,
+                                )
                                 sw.add_figure('generated/y_hat_spec_{}'.format(j),
                                               plot_spectrogram(y_hat_spec.squeeze(0).cpu().numpy()), steps)
 
@@ -236,8 +254,8 @@ def main():
     parser.add_argument('--input_validation_file', default='LJSpeech-1.1/validation.txt')
     parser.add_argument('--checkpoint_path', default='cp_hifigan')
     parser.add_argument('--config', default='')
-    parser.add_argument('--training_epochs', default=3100, type=int)
-    parser.add_argument('--stdout_interval', default=5, type=int)
+    parser.add_argument('--training_epochs', default=3000, type=int)
+    parser.add_argument('--stdout_interval', default=100, type=int)
     parser.add_argument('--checkpoint_interval', default=5000, type=int)
     parser.add_argument('--summary_interval', default=100, type=int)
     parser.add_argument('--validation_interval', default=1000, type=int)
